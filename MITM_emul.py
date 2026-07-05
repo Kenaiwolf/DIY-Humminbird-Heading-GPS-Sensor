@@ -34,9 +34,9 @@ M9N_PORT   = "COM10"
 BAUD_RATE  = 38400  
   
 # Static injection values (until I2C compass is wired)  
-STATIC_HEADING = 222    # integer degrees 0-359  
-STATIC_V1      = 0      # PTSI160 field 1 (quality, observed range 3-7)  
-STATIC_V2      = 0     # PTSI160 field 2 (gyro/tilt, observed range 0 to -9)  
+STATIC_HEADING = 216    # integer degrees 0-359  
+STATIC_V1      = 6      # PTSI160 field 1 (quality, observed range 3-7)  
+STATIC_V2      = -9     # PTSI160 field 2 (gyro/tilt, observed range 0 to -9)  
   
 try:  
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  
@@ -271,7 +271,7 @@ def injection_thread(ser_helix):
     tick     = 0  
   
     while not stop_event.is_set():  
-        gphdg   = build_gphdg("333")  
+        gphdg   = build_gphdg(STATIC_HEADING)  
         ptsi160 = build_ptsi160(STATIC_V1, STATIC_V2, STATIC_HEADING)  
   
         with helix_write_lock:  
