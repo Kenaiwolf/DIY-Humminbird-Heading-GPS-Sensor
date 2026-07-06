@@ -1,409 +1,341 @@
 # DIY Heading and GPS Receiver for Humminbird Sonars
 
-An open-source DIY Heading and GPS Receiver for Humminbird Sonars project documenting the proprietary NMEA 0183
-protocol used by Humminbird Helix fish finders to communicate with the AS GPS HS
-heading sensor. The goal is to allow any standard GPS + compass module (e.g.
-Holybro M9N) to replace the expensive factory sensor.
+This project provides an open-source solution for interfacing custom GPS and
+heading sensors with Humminbird sonar units (specifically the Helix series).
+The goal is to provide a modern, affordable, and DIY-friendly alternative to
+the factory AS GPS HS sensor by emulating the proprietary NMEA 0183 protocol
+required by Humminbird devices.
 
-> **Status:** Protocol fully reverse-engineered and emulation confirmed working on
-> Humminbird Helix. Heading displays correctly. GPS position and satellite data
-> pass through via UBX. Active development ongoing.
+## Support the Project
 
----
+If this project helped you save money or improved your boat's navigation,
+please consider supporting the ongoing development. Your contributions help
+cover hardware costs and the time spent refining the protocol.
 
-## Table of Contents
-
-1. [How It Works](#how-it-works)
-2. [Hardware](#hardware)
-3. [Wiring](#wiring)
-4. [Protocol Reference](#protocol-reference)
-   - [Serial Parameters](#serial-parameters)
-   - [Sentence Set](#sentence-set)
-   - [Timing](#timing)
-   - [$PTSI160 — Heading + Pitch + Roll](#ptsi160--heading--pitch--roll)
-   - [Helix Handshake Sequence](#helix-handshake-sequence)
-   - [Helix Query-Response](#helix-query-response)
-5. [Heading Color: Yellow vs Green](#heading-color-yellow-vs-green)
-6. [Tools](#tools)
-7. [Log Files](#log-files)
-8. [Known Findings & Open Questions](#known-findings--open-questions)
-9. [Contributing](#contributing)
-10. [Disclaimer](#disclaimer)
+[![Sponsor] placeholder
+[![Buy Me a Coffee] placeholder
 
 ---
 
-## How It Works
+## Overview
 
-The Humminbird Helix expects a specific device on its GPS/heading port that speaks
-a proprietary dialect of NMEA 0183. The factory device is the **AS GPS HS**
-(Humminbird part). This project emulates that device using a PC (or microcontroller)
-sitting between the Helix and a standard GPS module.
+The Humminbird Helix series communicates with its GPS/heading sensor over a
+single RS-232 serial link at **38400 baud, 8N1**. The protocol is pure
+**NMEA 0183 ASCII** — there is no binary framing, no proprietary baud-rate
+negotiation, and no special startup sequence required from the sensor side.
 
-
-┌──────────┐  UART 38400  ┌──────────────────┐  UART 38400  ┌──────────┐
-│  Helix   │◄────────────►│  Emulator (PC/   │◄────────────►│  M9N GPS │
-│  Sonar   │              │  MCU + CH340)    │              │  Module  │
-└──────────┘              └──────────────────┘              └──────────┘
-                                   │
-                              I2C (future)
-                                   │
-                            ┌──────────────┐
-                            │  Compass /   │
-                            │  IMU module  │
-                            └──────────────┘
-
-
-The emulator:
-1. Forwards GPS data (UBX binary) between the Helix and M9N transparently.
-2. Injects the proprietary NMEA sentences the Helix requires to show heading.
-3. Responds to heading queries from the Helix in real time.
+The sensor must send four sentence types at specific rates. Missing
+`$GNRMC`/`$GNGGA` causes the Helix to repeatedly reset its GPS satellite
+search. Missing `$PTSI160` causes the heading to not appear on screen.
 
 ---
 
-## Hardware
+## Protocol — Sentence Set (Sensor → Helix)
 
-| Component | Notes |
-|---|---|
-| **Holybro M9N GPS** | u-blox M9N chip, onboard IST8310 compass (I2C), JST-GH 6-pin connector |
-| **CH340 USB-to-serial** | Any CH340/CH341 breakout board with 3.3V/5V jumper |
-| **PC running Python 3.8+** | Runs the MITM emulator script |
-| **Humminbird Helix** | Tested on Helix series; all models compatible with AS GPS HS should behave identically |
+All sentences use standard NMEA 0183 checksum (`*XX\r\n` terminator).
 
-> **Note on M9N baud rate:** The M9N ships at 9600 baud on UART1. The Helix
-> auto-negotiates the baud rate upward via UBX commands. Set the CH340 script to
-> 38400 — the Helix will handle the negotiation. If the M9N was previously
-> configured to 115200, reset it to 9600 in u-center before connecting.
+### Timing (strictly observed in captured logs)
 
----
-
-## Wiring
-
-### CH340 → Holybro M9N (JST-GH 6-pin)
-
-| CH340 Pin | M9N Pin | Signal | Notes |
+| Sentence | Rate | Interval | Notes |
 |---|---|---|---|
-| VCC | Pin 1 | 5V power | M9N is 5V powered |
-| GND | Pin 6 | Ground | Common ground, mandatory |
-| TXD | Pin 2 | UART RX | CH340 transmits → M9N receives |
-| RXD | Pin 3 | UART TX | M9N transmits → CH340 receives |
-| — | Pin 4 | I2C SCL | Compass — not used yet (future) |
-| — | Pin 5 | I2C SDA | Compass — not used yet (future) |
+| `$GNRMC` | 5 Hz | 200 ms | **Mandatory.** Void (`V`) when no GPS fix. |
+| `$GNGGA` | 5 Hz | 200 ms | **Mandatory.** Fix quality `0` when no fix. |
+| `$GPHDG` | 2 Hz | 500 ms | Magnetic heading. |
+| `$PTSI160` | 1 Hz | 1000 ms | Proprietary heading + tilt. Always immediately after a `$GPHDG` tick. |
 
-> **Voltage:** M9N UART logic is 3.3V. Set the CH340 jumper to **3.3V** to avoid
-> overvoltage on the M9N RX pin. If your CH340 is 5V-only, add a 1kΩ/2kΩ voltage
-> divider on the TXD → M9N RX line.
+`$GNRMC` and `$GNGGA` are sent as a pair (GGA follows RMC by ~10 ms).
+`$GPHDG` appears ~150 ms after a `$GNRMC`/`$GNGGA` pair.
+`$PTSI160` fires on every second `$GPHDG` tick (i.e., every 1000 ms).
 
-### Helix GPS Port → CH340 (second adapter)
+### Sentence formats
 
-Connect the Helix GPS/heading port to a second CH340 adapter:
-
-| Helix port | CH340 |
-|---|---|
-| TX | RXD |
-| RX | TXD |
-| GND | GND |
-
-Both CH340 adapters connect to the same PC running the emulator script.
-
----
-
-## Protocol Reference
-
-### Serial Parameters
-
-| Parameter | Value |
-|---|---|
-| Baud rate | **38400** |
-| Data bits | 8 |
-| Parity | None |
-| Stop bits | 1 |
-| Flow control | None |
-| Protocol | Pure NMEA 0183 ASCII (no binary framing) |
-
-The single `0x00` byte observed at power-on is a UART line-idle startup glitch,
-not a sync byte. There is no baud-rate negotiation on the sensor side.
-
-### Sentence Set
-
-The emulator must send the following sentences to the Helix. All sentences use
-standard NMEA 0183 checksum (XOR of all bytes between `$` and `*`, 2-digit
-uppercase hex).
-
-| Sentence | Rate | Direction | Purpose |
-|---|---|---|---|
-| `$GNRMC` | 5 Hz (200ms) | Emulator → Helix | GPS position/time. Void (`V`) when no fix. |
-| `$GNGGA` | 5 Hz (200ms) | Emulator → Helix | GPS fix data. Fix quality `0` when no fix. |
-| `$GPHDG` | 2 Hz (500ms) | Emulator → Helix | Magnetic heading broadcast. |
-| `$PTSI160` | 1 Hz (1000ms) | Emulator → Helix | Proprietary heading + pitch + roll. |
-
-**Without `$GNRMC` and `$GNGGA`, the Helix will not activate heading display.**
-These sentences are required even when there is no GPS fix — send them void.
-
-#### Example sentences (no GPS fix)
-
+**No GPS fix (typical at startup or indoors):**
 ```
-$GNRMC,163223.91,V,,,,,,,,,,N*6C
-$GNGGA,163223.91,,,,,0,00,99.99,,,,,,*77
-$GPHDG,216.0,0.0,E,0.0,E*5B
-$PTSI160,6,-9,216*12
+$GNRMC,HHMMSS.ss,V,,,,,,,,,,N*CS
+$GNGGA,HHMMSS.ss,,,,,0,00,99.99,,,,,,*CS
+$GPHDG,HHH.H,0.0,E,0.0,E*CS
+$PTSI160,V1,V2,HHH*CS
 ```
 
-#### Example sentences (GPS fix acquired)
-
+**GPS fix acquired:**
 ```
-$GNRMC,163848.40,A,4757.97197,N,01723.51089,E,0.019,,050726,,,A*66
-$GNGGA,163848.40,4757.97197,N,01723.51089,E,1,08,1.14,118.6,M,41.1,M,,*42
-$GPHDG,257.0,0.0,E,5.5,E*5E
-$PTSI160,8,1,257*3C
-```
-
-Note: when a GPS fix is present, the magnetic variation field in `$GPHDG` is
-populated (e.g. `5.5,E`) instead of `0.0,E`.
-
-### Timing
-
-Timing is measured from the captured AS GPS HS log and must be followed strictly.
-The Helix monitors sentence cadence and will reset the sensor connection if
-sentences stop or become irregular.
-
-```
-t=0ms    → $GNRMC + $GNGGA  (pair, ~10ms apart)
-t=150ms  → $GPHDG
-t=200ms  → $GNRMC + $GNGGA
-t=400ms  → $GNRMC + $GNGGA
-t=500ms  → $GPHDG  (+ $PTSI160 on every other GPHDG tick = 1 Hz)
-t=600ms  → $GNRMC + $GNGGA
-t=800ms  → $GNRMC + $GNGGA
-t=1000ms → repeat
+$GNRMC,HHMMSS.ss,A,DDMM.mmmmm,N,DDDMM.mmmmm,E,SPD,,DDMMYY,,,A*CS
+$GNGGA,HHMMSS.ss,DDMM.mmmmm,N,DDDMM.mmmmm,E,1,NN,H.HH,ALT,M,GEO,M,,*CS
+$GPHDG,HHH.H,0.0,E,MAG_VAR,E*CS
+$PTSI160,V1,V2,HHH*CS
 ```
 
-Use `time.perf_counter()` with accumulating `next_t += interval` (not
-`next_t = time.time()`) to prevent timing drift over long sessions.
-
-### $PTSI160 — Heading + Pitch + Roll
+### $PTSI160 — Field Definitions
 
 ```
 $PTSI160,V1,V2,HHH*CS
 ```
 
-| Field | Meaning | Range observed | Notes |
+| Field | Meaning | Unit | Notes |
 |---|---|---|---|
-| `V1` | **Pitch** (integer degrees) | 3 – 8 | Positive = nose up |
-| `V2` | **Roll** (integer degrees) | -15 – +1 | Negative = port/left side down |
-| `HHH` | Magnetic heading (integer degrees) | 0 – 359 | |
-| `CS` | NMEA XOR checksum | — | 2-digit uppercase hex |
+| `V1` | **Pitch** | Integer degrees | Positive = nose up. Range observed: 3–8. |
+| `V2` | **Roll** | Integer degrees | Negative = port side down, positive = starboard side down. Range observed: -15 to +1. |
+| `HHH` | **Magnetic heading** | Integer degrees | 0–359. Must match `$GPHDG`. |
 
-**Evidence for pitch/roll interpretation:**
-- At startup on a desk with cables pulling the sensor: V1=3–7, V2=0 to -9
-  (consistent with a slight nose-up tilt and port-side cable weight).
-- After moving the sensor to a window on its twisted wire: V1=8, V2=+1
-  (new physical orientation, nearly level roll, more nose-up pitch).
-- V1 shows ±1° noise while stationary (normal accelerometer resolution).
-- V2 stays rock-solid at -9 while stationary (static cable-induced tilt).
+**Evidence:** In the original AS GPS HS capture, the sensor was stationary on
+a desk with cables pulling it to one side: V1 oscillated 5–6°, V2 held steady
+at -9° (permanent cable-induced tilt). When the sensor was moved to a window
+for GPS lock and placed on its twisted cable, both values changed simultaneously
+to V1=8, V2=+1, consistent with a new physical orientation.
 
-For a static emulator with no IMU, use `V1=6, V2=-9` as a reasonable
-approximation of a sensor sitting on a desk. On a real boat mount, both values
-will be small (±5°) and relatively stable.
+### $GPHDG — Magnetic Variation
 
-**Checksum calculation:**
-```python
-def nmea_checksum(sentence_body: str) -> str:
-    c = 0
-    for ch in sentence_body:
-        c ^= ord(ch)
-    return f"{c:02X}"
-
-# Example: body = "PTSI160,6,-9,216"
-# checksum = nmea_checksum("PTSI160,6,-9,216") → "12"
-# full sentence: "$PTSI160,6,-9,216*12\r\n"
-```
-
-### Helix Handshake Sequence
-
-The Helix initiates the handshake approximately 38–60 seconds after the emulator
-starts sending sentences. The emulator does not need to respond to these — just
-keep sending the broadcast sentences and the Helix will proceed automatically.
-
-```
-Helix → Emulator:  $PTSI153,5*30    ← identification probe
-Helix → Emulator:  $PTSI150,3*35    ← secondary probe
-```
-
-After the probes, the Helix enters polling mode and sends queries every ~330ms.
-
-### Helix Query-Response
-
-Once in polling mode, the Helix sends NMEA query sentences to the emulator. The
-emulator should respond immediately to heading queries. Other queries (depth,
-position, temperature) can be ignored or answered with void/empty responses.
-
-| Helix query | Emulator response | Notes |
-|---|---|---|
-| `$INHDG,,,V,,V*60` | `$GPHDG,HHH.H,0.0,E,0.0,E*CS` | Respond with current heading |
-| `$INHDT,,T*0B` | `$GPHDT,HHH.H,T*CS` | True heading (same value as magnetic for now) |
-| `$INDPT,,*47` | *(no response needed)* | Depth query — ignore |
-| `$INGLL,,,,,,V*16` | *(no response needed)* | Position query — ignore |
-| `$INVTG,,T,,M,,N,,K*5E` | *(no response needed)* | Speed/course query — ignore |
-| `$INMTW,,*49` | *(no response needed)* | Water temperature — ignore |
-| `$INRMC,,V,...*CS` | *(no response needed)* | RMC query — ignore |
-| `$INGGA,,,,,,0,...*CS` | *(no response needed)* | GGA query — ignore |
-| `$INZDA,,,,,,*58` | *(no response needed)* | Time query — ignore |
-
-Without broadcast sentences (`$GPHDG`, `$PTSI160`), the Helix polling rate drops
-from ~330ms to ~1000ms. The connection stays alive either way.
+When no GPS fix: variation field is `0.0,E` (zero).
+When GPS fix acquired: variation field is populated from the GPS almanac
+(e.g., `5.5,E` for Eastern Europe).
 
 ---
 
-## Heading Color: Yellow vs Green
+## Helix Initialization Sequence
 
-| Color | Meaning | Condition |
+After power-on, the Helix waits approximately 59 seconds before sending its
+first probe sentence. The full handshake:
+
+1. **~59 s after first sentence received:**
+   Helix → Sensor: `$PTSI153,5*30`
+
+2. **~14 s later:**
+   Helix → Sensor: `$PTSI150,3*35`
+
+3. **Immediately after `$PTSI150`:** Helix begins normal NMEA output on the
+   same port (see section below).
+
+The sensor does **not** need to reply to either probe sentence. The Helix
+proceeds regardless. No re-probe occurs as long as the sensor keeps sending
+its sentence set.
+
+---
+
+## Helix NMEA Output ($IN Sentences)
+
+The Helix outputs its own NMEA sentences on the same serial port it uses to
+communicate with the sensor. The talker ID `IN` is Humminbird's proprietary
+identifier (Integrated Navigation). These sentences can be turned on/off in
+the Helix settings and can also be switched to standard `$GN` prefix.
+
+The emulator does **not** need to parse or respond to these sentences.
+They are informational output only.
+
+| Sentence | Content | Rate |
 |---|---|---|
-| **Yellow** | Heading present, GPS not confirmed | No GPS position fix |
-| **Green** | Heading confirmed | GPS fix acquired (fix quality ≥ 1) |
+| `$INHDG,,,V,,V*60` | Heading (void when no GPS fix) | ~1 Hz |
+| `$INHDT,,T*0B` | True heading (void) | ~1 Hz |
+| `$INDPT,,*47` | Depth (void) | ~1 Hz |
+| `$INRMC,,V,...` | RMC position (void) | ~1 Hz |
+| `$INGLL,,,,,,V*16` | GLL position (void) | ~0.5 Hz |
+| `$INVTG,,T,,M,,N,,K*5E` | Speed/course (void) | ~0.5 Hz |
+| `$INGGA,,,,,,0,...` | GGA position (void) | ~0.5 Hz |
+| `$INZDA,,,,,,*58` | Date/time (void) | ~0.5 Hz |
+| `$INMTW,,*49` | Water temperature (void) | ~0.5 Hz |
 
-The Helix uses the GPS fix status (received from the M9N via UBX) to determine
-whether to show heading as confirmed (green) or unconfirmed (yellow). This is
-**not** based on COG vs HDG agreement — on a real boat, wind and current routinely
-cause 10–30° difference between COG and HDG, so the Helix cannot use that as a
-confirmation criterion.
+---
 
-**To get green heading:** take the unit outdoors so the M9N acquires satellite
-lock. The Helix will update its GPS state via UBX and change the heading color
-automatically. No changes to the emulator are needed.
+## Heading Color on Screen — Yellow vs Green
 
-**Both `$GPHDG` and `$PTSI160` contribute to the displayed heading.** When they
-carry different values (tested experimentally), some Helix models oscillate between
-the two values and others display an average. Always keep them in sync.
+**Yellow heading is normal and expected.** Even the original AS GPS HS shows
+yellow heading. This is Humminbird's color coding:
+
+- **Yellow** = HDG — compass-derived magnetic heading from the sensor
+- **Green** = COG — GPS-derived course over ground
+
+These are fundamentally different data sources. On a real boat, HDG and COG
+almost never agree due to wind and current (leeway/set and drift), so the
+Helix always displays them separately with different colors. Yellow heading
+does not indicate an error or missing data.
+
+---
+
+## Hardware
+
+### Minimum Required Components
+
+| Component | Purpose |
+|---|---|
+| Microcontroller (ESP32, Arduino, Raspberry Pi, etc.) | Runs the emulator firmware |
+| Magnetometer / compass module | Provides magnetic heading |
+| CH340 or similar USB-UART adapter | PC-based testing / MITM logging |
+| GPS module (e.g., Holybro M9N, u-blox NEO-M9N) | GPS position + time |
+
+### CH340 → Holybro M9N Wiring (UART)
+
+The Holybro M9N uses a JST-GH 6-pin connector:
+
+| M9N Pin | Signal | CH340 Pin | Notes |
+|---|---|---|---|
+| 1 | VCC (5 V) | VCC | Power from CH340 board |
+| 2 | UART RX | TXD | CH340 transmits → M9N receives |
+| 3 | UART TX | RXD | M9N transmits → CH340 receives |
+| 4 | I2C SCL | — | Compass only, not used for UART |
+| 5 | I2C SDA | — | Compass only, not used for UART |
+| 6 | GND | GND | Common ground, mandatory |
+
+> **Voltage warning:** The M9N UART logic is 3.3 V. Set the CH340 board
+> jumper to **3.3 V**. If your CH340 is 5 V only, add a voltage divider
+> (1 kΩ + 2 kΩ) on the TXD → M9N RX line to avoid damaging the module.
+
+**Default baud rate:** The M9N ships at 38400 baud on UART1, matching the
+Helix. If the M9N has been reconfigured (e.g., to 115200), use u-center to
+reset it to 38400 before connecting.
+
+### Helix Serial Port
+
+Connect the sensor to the Helix's GPS/heading port (the dedicated 4-pin
+Humminbird accessory connector). Baud rate: **38400, 8N1**.
+
+---
+
+## NMEA Checksum Calculation
+
+```python
+def nmea_checksum(sentence: str) -> str:
+    """
+    Input:  sentence body without $ prefix and without *CS suffix
+    Output: two-character uppercase hex checksum string
+    Example: nmea_checksum("GPHDG,216.0,0.0,E,0.0,E") -> "5B"
+    """
+    c = 0
+    for ch in sentence:
+        c ^= ord(ch)
+    return f"{c:02X}"
+
+def build_sentence(body: str) -> bytes:
+    cs = nmea_checksum(body)
+    return f"${body}*{cs}\r\n".encode("ascii")
+```
 
 ---
 
 ## Tools
 
-### `MITM_Sniff2.py` — Protocol Sniffer
+### MITM_Sniff2.py — Protocol Capture Tool
 
-A Man-in-the-Middle serial proxy that sits between the Helix and the real AS GPS HS
-(or any device). Forwards all bytes in both directions and logs everything.
+Sits between the Helix and the real AS GPS HS (or any sensor) and logs all
+traffic in both directions without modifying it.
 
-**Usage:**
+**Configuration:**
+```python
+HELIX_PORT    = "COM1"   # port connected to Helix
+AS_GPS_HS_PORT = "COM10" # port connected to sensor
+BAUD_RATE     = 38400
 ```
-pip install pyserial
-python MITM_Sniff2.py
-```
 
-Configure `HELIX_PORT`, `AS_GPS_HS_PORT`, and `BAUD_RATE` at the top of the file.
-
-**Output files (per session):**
+**Output files per session:**
 
 | File | Contents |
 |---|---|
-| `serial_log_TIMESTAMP.bin` | Raw bytes from both directions, interleaved |
-| `timestamp_log_TIMESTAMP.csv` | Every raw chunk with timestamp, direction, hex |
-| `nmea_log_TIMESTAMP.txt` | Decoded NMEA sentences with timestamps |
+| `serial_log_YYYYMMDD_HHMMSS.bin` | Raw binary — every byte from both directions |
+| `timestamp_log_YYYYMMDD_HHMMSS.csv` | Timestamped hex dump of every read chunk |
+| `nmea_log_YYYYMMDD_HHMMSS.txt` | Human-readable NMEA sentences with timestamps |
 
-### `MITM_emul.py` — Heading Emulator / Diagnostic Tool
+### MITM_emul.py / MITM_emul2.py — Emulator / Diagnostic Tool
 
-Replaces the AS GPS HS. Forwards GPS (UBX) between Helix and M9N, and injects
-the required heading sentences. Includes:
+Replaces the real AS GPS HS. Injects heading sentences into the Helix stream
+while forwarding GPS data from a real GPS module (e.g., M9N).
 
-- Separate independent timers for `$GNRMC`/`$GNGGA` (5 Hz), `$GPHDG` (2 Hz),
-  and `$PTSI160` (1 Hz).
-- Responds to `$INHDG` and `$INHDT` queries from the Helix in real time.
-- `ValueGenerator` with multiple diagnostic sweep modes for V1/V2/heading testing.
-- Keyboard-controlled mode switching at runtime (Windows: `msvcrt`).
-- Full logging identical to `MITM_Sniff2.py`.
+**Key features:**
+- Separate independent timers for `$GNRMC`/`$GNGGA` (200 ms), `$GPHDG`
+  (500 ms), and `$PTSI160` (1000 ms) — strictly matching real sensor timing
+- Multiple `$PTSI160` test modes: `static`, `v1_sweep`, `v2_sweep`,
+  `v1v2_grid`, `heading_sweep`
+- Runtime mode switching via keyboard (Windows `msvcrt`)
+- Configurable dwell time per test step
+- Full MITM logging (same format as MITM_Sniff2.py)
+- Thread-safe write lock on the Helix port
 
-**Keyboard controls:**
-
+**Keyboard controls (runtime):**
 | Key | Action |
 |---|---|
 | `M` | Cycle to next test mode |
-| `N` | Advance to next value in current sweep |
+| `N` | Advance to next value (skip dwell) |
 | `P` | Previous value |
-| `R` | Reset sweep to start |
-| `+` / `-` | Increase / decrease dwell time per step |
+| `R` | Reset to start of current mode |
+| `+` / `-` | Increase / decrease dwell time by 5 s |
 | `H` | Toggle `$GPHDG` on/off |
 | `T` | Toggle `$PTSI160` on/off |
 | `Q` / Ctrl+C | Stop |
 
-**Test modes:**
+---
 
-| Mode | What cycles | Fixed values |
+## Captured Log Files
+
+| Session | File | Description |
 |---|---|---|
-| `static` | Nothing | V1=6, V2=-9, HHH=216 |
-| `v1_sweep` | V1: 0 → 15 | V2=-9, HHH=216 |
-| `v2_sweep` | V2: -15 → +15 | V1=6, HHH=216 |
-| `v1v2_grid` | All (V1, V2) pairs | HHH=216 |
-| `heading_sweep` | HHH: 0 → 350 step 10 | V1=6, V2=-9 |
+| 2026-07-05 18:31 | `nmea_log_20260705_183137.txt` | **Original AS GPS HS** — real sensor, no fix → GPS fix acquired outdoors. Reference capture. |
+| 2026-07-05 18:31 | `serial_log_20260705_183137.bin` | Raw binary of above session |
+| 2026-07-05 23:47 | `nmea_log_20260705_234714.txt` | First emulator test — heading injection working, M9N on wrong baud |
+| 2026-07-05 23:47 | `serial_log_20260705_234714.bin` | Raw binary of above session |
+| 2026-07-06 01:03 | `nmea_log_20260706_010331.txt` | V1/V2 sweep test — confirmed V1 and V2 do not affect displayed heading |
+| 2026-07-06 01:38 | `nmea_log_20260706_013844.txt` | Split-heading test — confirmed both `$GPHDG` and `$PTSI160` contribute to display |
 
 ---
 
-## Log Files
+## Key Findings Summary
 
-All captured session logs are in the repository root.
+1. **Protocol is pure NMEA ASCII.** No binary framing, no baud negotiation.
+   38400 baud, 8N1.
 
-| File | Session | Description |
-|---|---|---|
-| `nmea_log_20260705_183137.txt` | Original AS GPS HS | Real sensor capture, includes GPS fix outdoors |
-| `serial_log_20260705_183137.bin` | Original AS GPS HS | Raw binary of the same session |
-| `timestamp_log_20260705_183137.csv` | Original AS GPS HS | Full hex log of every byte |
-| `nmea_log_20260706_010331.txt` | Emulator V1/V2 sweep | V1 sweep (0–15), V2 sweep (-15 to +15), V1V2 grid |
-| `nmea_log_20260706_013844.txt` | Split-heading test | GPHDG vs PTSI160 isolation test, 7 phases |
-| `serial_log_20260706_013844.bin` | Split-heading test | Raw binary including UBX M9N traffic |
+2. **`$GNRMC` and `$GNGGA` are mandatory.** Without them the Helix resets
+   its GPS satellite search repeatedly. Send them void (no fix) at 5 Hz from
+   the moment the sensor powers on.
+
+3. **`$PTSI160` V1 = pitch, V2 = roll** (integer degrees). The Helix uses
+   these for tilt display. They do not affect the heading value shown on
+   screen. For a fixed mount, use measured static tilt values. For a dynamic
+   mount, read from an IMU.
+
+4. **Both `$GPHDG` and `$PTSI160` contribute to the displayed heading.**
+   When they conflict, the Helix averages or oscillates between them. Keep
+   both sentences in sync with the same heading value.
+
+5. **The Helix does not require a response to its probe sentences**
+   (`$PTSI153`, `$PTSI150`). It proceeds to normal operation regardless.
+
+6. **Yellow heading is normal.** Yellow = compass HDG, Green = GPS COG.
+   This is Humminbird's standard color coding, not an error indicator.
+
+7. **The Helix outputs its own NMEA sentences** (`$INHDG`, `$INRMC`, etc.)
+   on the same port. These are normal output sentences (talker ID `IN` =
+   Humminbird). They can be turned off or switched to `$GN` in Helix settings.
+   The sensor does not need to respond to them.
+
+8. **Helix initialization takes ~59 seconds** from first sentence received
+   before it sends `$PTSI153`. This is normal.
 
 ---
 
-## Known Findings & Open Questions
+## Getting Started
 
-### Confirmed
+1. **Capture your own logs** using `MITM_Sniff2.py` to verify your specific
+   Helix model behaves the same way.
 
-- **`$GNRMC` + `$GNGGA` are mandatory.** Without them the Helix does not activate
-  heading display. The real AS GPS HS sends them at 5 Hz even with no GPS fix.
-- **`$PTSI160` V1 = pitch, V2 = roll** (integer degrees). Confirmed by correlating
-  values with physical sensor movement and repositioning.
-- **Both `$GPHDG` and `$PTSI160` drive the heading display.** They must be kept
-  in sync.
-- **Query-response alone is sufficient** to maintain the Helix connection (tested
-  in RESP_ONLY mode), but broadcast sentences are needed for the 330ms polling rate.
-- **The Helix communicates with the M9N via UBX binary protocol**, not NMEA. The
-  Helix auto-negotiates baud rate from 9600 upward via UBX-CFG-PRT commands.
-- **Yellow heading = no GPS fix.** Green heading requires satellite lock. This is
-  not related to COG vs HDG agreement.
-- **No binary protocol on the sensor side.** The AS GPS HS → Helix link is pure
-  NMEA 0183 ASCII at 38400 baud. The single `0x00` at power-on is a UART glitch.
+2. **Run the emulator** (`MITM_emul2.py`) with a CH340 on COM1 (Helix side)
+   and your GPS module on COM10. Start in `static` mode to confirm heading
+   appears on screen.
 
-### Open Questions
+3. **Connect your compass** (e.g., IST8310 via I2C on the M9N) and feed
+   real pitch/roll into V1/V2 and real heading into `$GPHDG` and `$PTSI160`.
 
-- **Exact sign convention for V1/V2.** Positive V1 = nose up is confirmed.
-  For V2: negative = port down is the working hypothesis based on one session.
-  Needs confirmation with a known-orientation mount.
-- **Whether the Helix uses V1/V2 for tilt compensation** of the displayed heading,
-  or only for diagnostics/display. The heading value in `$PTSI160` is always an
-  integer — if tilt compensation were applied internally, sub-degree precision
-  would be expected.
-- **`$PTSI153` response.** The Helix sends `$PTSI153,5*30` as a probe. The real
-  AS GPS HS may send a response not captured in the MITM log. So far the emulator
-  works without responding to it.
-- **I2C compass integration.** The M9N's IST8310 compass is connected via I2C but
-  not yet read by the emulator. Currently using static heading. Next step: read
-  pitch and roll from the accelerometer and feed into V1/V2.
+4. **Take it outdoors** to acquire a GPS fix. The `$GNRMC`/`$GNGGA` sentences
+   will automatically populate with real position data once the GPS module
+   has a fix.
 
 ---
 
 ## Contributing
 
-Contributions are welcome. The most valuable contributions are:
+This is a community-driven project. Contributions welcome:
 
-- **Logs from other Helix models** — upload to the repository root following the
-  naming convention `nmea_log_YYYYMMDD_HHMMSS.txt` etc.
-- **I2C compass integration** — reading IST8310 or any other compass/IMU and
-  feeding real heading, pitch, and roll into the emulator.
-- **Microcontroller port** — porting the emulator logic to ESP32 or Arduino for
-  a standalone device without a PC.
-- **Magnetic variation** — integrating a WMM (World Magnetic Model) library to
-  populate the variation field in `$GPHDG` correctly from GPS position.
-
-Please include comments in all code and follow the existing log format so sessions
-remain comparable.
+- **Add logs:** If you have logs from different Humminbird devices, please
+  upload them to the `/data` folder.
+- **Test other Helix models:** The protocol is expected to be identical across
+  all Helix models compatible with the AS GPS HS accessory.
+- **Improve the emulator:** Pull requests welcome. Please include comments in
+  all code and follow the existing log format so sessions remain comparable.
 
 ---
 
@@ -412,5 +344,77 @@ remain comparable.
 This project is an independent DIY initiative. It is not affiliated with,
 endorsed by, or sponsored by Humminbird or its parent company Johnson Outdoors.
 Use at your own risk. Do not rely on this for safety-critical navigation.
+``` [1](#31-0) [2](#31-1) [3](#31-2) [4](#31-3) [5](#31-4)
 
+### Citations
 
+**File:** nmea_log_20260705_183137.txt (L1-4)
+```text
+[2026-07-05 18:31:49.720] [AS_GPS_HS->Helix] $GNRMC,,V,,,,,,,,,,N*4D
+[2026-07-05 18:31:49.730] [AS_GPS_HS->Helix] $GNGGA,,,,,,0,00,99.99,,,,,,*56
+[2026-07-05 18:31:49.870] [AS_GPS_HS->Helix] $GPHDG,216.0,0.0,E,0.0,E*5B
+[2026-07-05 18:31:49.870] [AS_GPS_HS->Helix] $PTSI160,3,0,216*33
+```
+
+**File:** nmea_log_20260705_183137.txt (L5850-5868)
+```text
+[2026-07-05 18:38:47.487] [AS_GPS_HS->Helix] $GNRMC,163848.40,A,4757.97197,N,01723.51089,E,0.019,,050726,,,A*66
+[2026-07-05 18:38:47.507] [AS_GPS_HS->Helix] $GNGGA,163848.40,4757.97197,N,01723.51089,E,1,08,1.14,118.6,M,41.1,M,,*42
+[2026-07-05 18:38:47.687] [AS_GPS_HS->Helix] $GNRMC,163848.60,A,4757.97196,N,01723.51089,E,0.052,,050726,,,A*6A
+[2026-07-05 18:38:47.707] [AS_GPS_HS->Helix] $GNGGA,163848.60,4757.97196,N,01723.51089,E,1,08,1.14,118.7,M,41.1,M,,*40
+[2026-07-05 18:38:47.857] [AS_GPS_HS->Helix] $GPHDG,257.0,0.0,E,5.5,E*5E
+[2026-07-05 18:38:47.867] [AS_GPS_HS->Helix] $PTSI160,8,1,257*3C
+[2026-07-05 18:38:47.887] [AS_GPS_HS->Helix] $GNRMC,163848.80,A,4757.97196,N,01723.51087,E,0.144,,050726,,,A*6C
+[2026-07-05 18:38:47.907] [AS_GPS_HS->Helix] $GNGGA,163848.80,4757.97196,N,01723.51087,E,1,08,1.14,118.7,M,41.1,M,,*40
+[2026-07-05 18:38:48.087] [AS_GPS_HS->Helix] $GNRMC,163849.00,A,4757.97196,N,01723.51087,E,0.092,,050726,,,A*6F
+[2026-07-05 18:38:48.107] [AS_GPS_HS->Helix] $GNGGA,163849.00,4757.97196,N,01723.51087,E,1,07,1.17,118.7,M,41.1,M,,*45
+[2026-07-05 18:38:48.287] [AS_GPS_HS->Helix] $GNRMC,163849.20,A,4757.97195,N,01723.51087,E,0.106,,050726,,,A*62
+[2026-07-05 18:38:48.307] [AS_GPS_HS->Helix] $GNGGA,163849.20,4757.97195,N,01723.51087,E,1,07,1.17,118.7,M,41.1,M,,*44
+[2026-07-05 18:38:48.357] [AS_GPS_HS->Helix] $GPHDG,258.0,0.0,E,5.5,E*51
+[2026-07-05 18:38:48.488] [AS_GPS_HS->Helix] $GNRMC,163849.40,A,4757.97195,N,01723.51083,E,0.236,,050726,,,A*60
+[2026-07-05 18:38:48.508] [AS_GPS_HS->Helix] $GNGGA,163849.40,4757.97195,N,01723.51083,E,1,07,1.17,118.9,M,41.1,M,,*48
+[2026-07-05 18:38:48.688] [AS_GPS_HS->Helix] $GNRMC,163849.60,A,4757.97195,N,01723.51084,E,0.020,,050726,,,A*60
+[2026-07-05 18:38:48.708] [AS_GPS_HS->Helix] $GNGGA,163849.60,4757.97195,N,01723.51084,E,1,08,1.14,118.9,M,41.1,M,,*41
+[2026-07-05 18:38:48.858] [AS_GPS_HS->Helix] $GPHDG,257.0,0.0,E,5.5,E*5E
+[2026-07-05 18:38:48.868] [AS_GPS_HS->Helix] $PTSI160,8,1,257*3C
+```
+
+**File:** nmea_log_20260706_013844.txt (L1749-1770)
+```text
+[2026-07-06 01:42:14.304] [PhaseAuto] NOTE: Phase 7/7: RESP_ONLY  GPHDG=OFF PTSI=OFF RESP=90
+[2026-07-06 01:42:14.790] [Helix->M9N] $INDPT,,*47
+[2026-07-06 01:42:14.794] [Helix->M9N] $INHDG,,,V,,V*60
+[2026-07-06 01:42:14.794] [RESP->Helix] $GPHDG,90.0,0.0,E,0.0,E*67
+[2026-07-06 01:42:14.800] [Helix->M9N] $INHDT,,T*0B
+[2026-07-06 01:42:14.800] [RESP->Helix] $GPHDT,90.0,T*0C
+[2026-07-06 01:42:14.807] [Helix->M9N] $INRMC,,V,,,,,,,,,*21
+[2026-07-06 01:42:15.790] [Helix->M9N] $INDPT,,*47
+[2026-07-06 01:42:15.794] [Helix->M9N] $INHDG,,,V,,V*60
+[2026-07-06 01:42:15.794] [RESP->Helix] $GPHDG,90.0,0.0,E,0.0,E*67
+[2026-07-06 01:42:15.798] [Helix->M9N] $INHDT,,T*0B
+[2026-07-06 01:42:15.798] [RESP->Helix] $GPHDT,90.0,T*0C
+[2026-07-06 01:42:15.806] [Helix->M9N] $INGLL,,,,,,V*16
+[2026-07-06 01:42:15.810] [Helix->M9N] $INVTG,,T,,M,,N,,K*5E
+[2026-07-06 01:42:15.816] [Helix->M9N] $INMTW,,*49
+[2026-07-06 01:42:16.789] [Helix->M9N] $INDPT,,*47
+[2026-07-06 01:42:16.794] [Helix->M9N] $INHDG,,,V,,V*60
+[2026-07-06 01:42:16.794] [RESP->Helix] $GPHDG,90.0,0.0,E,0.0,E*67
+[2026-07-06 01:42:16.802] [Helix->M9N] $INHDT,,T*0B
+[2026-07-06 01:42:16.803] [RESP->Helix] $GPHDT,90.0,T*0C
+[2026-07-06 01:42:16.810] [Helix->M9N] $INRMC,,V,,,,,,,,,*21
+[2026-07-06 01:42:17.789] [Helix->M9N] $INDPT,,*47
+```
+
+**File:** MITM_Sniff2.py (L29-31)
+```python
+HELIX_PORT = "COM1"
+AS_GPS_HS_PORT = "COM10"
+BAUD_RATE = 38400
+```
+
+**File:** MITM_Sniff2.py (L40-42)
+```python
+LOG_FILE_BIN = os.path.join(SCRIPT_DIR, f"serial_log_{SESSION_TS}.bin")
+LOG_FILE_CSV = os.path.join(SCRIPT_DIR, f"timestamp_log_{SESSION_TS}.csv")
+LOG_FILE_TXT = os.path.join(SCRIPT_DIR, f"nmea_log_{SESSION_TS}.txt")
+```
