@@ -11,10 +11,7 @@ required by Humminbird devices.
 If this project helped you save money or improved your boat's navigation,
 please consider supporting the ongoing development. Your contributions help
 cover hardware costs and the time spent refining the protocol.
-
-[![Sponsor] placeholder
-[![Buy Me a Coffee] placeholder
-
+Any help welcomed, just send me an email. 
 ---
 
 ## Overview
